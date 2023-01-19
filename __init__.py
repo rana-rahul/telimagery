@@ -329,8 +329,8 @@ def colour_image(img: npt.NDArray, cmap: IMCCmap) -> npt.NDArray:
     empty_img = np.zeros_like(input_array)
 
     red_arr = np.dstack((input_array, empty_img, empty_img))
-    green_arr = np.dstack((input_array, img, empty_img))
-    blue_arr = np.dstack((input_array, empty_img, img))
+    green_arr = np.dstack((empty_img, input_array, empty_img))
+    blue_arr = np.dstack((empty_img, empty_img, input_array))
 
     if cmap == IMCCmap.grey:
         array = input_array
