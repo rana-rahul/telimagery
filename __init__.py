@@ -5,17 +5,20 @@
 from __future__ import annotations
 
 import datetime
+import glob
 import os
 import pathlib
 import re
 from typing import Optional, Tuple
+import zipfile
 
 import attr
 import pandas as pd
 import numpy as np
 import numpy.typing as npt
 from matplotlib import pyplot as plt
-from skimage import filters
+from scipy import ndimage as ndi
+from skimage import filters, morphology, segmentation, feature
 from strenum import StrEnum
 
 
@@ -29,6 +32,13 @@ class IMCCmap(StrEnum):
     yellow = "yellow"
     cyan = "cyan"
     magenta = "magenta"
+
+
+class Tissue(StrEnum):
+    """Enum for tissue types"""
+
+    xenograft = "xenograft"
+    standard = "standard"
 
 
 @attr.define
@@ -54,8 +64,8 @@ class IMCMassChannelMetadata:
     mass: int
     cell_feature: Optional[str]
 
-    @staticmethod
-    def from_txt_file(txt_file: pathlib.Path) -> IMCMassChannelMetadata:
+    @classmethod
+    def from_txt_file(cls, txt_file: pathlib.Path) -> IMCMassChannelMetadata:
         """Extracts mass channel metadata from an input .txt file
 
         This is slightly hacky since metadata extraction
@@ -200,7 +210,7 @@ class IMCMassChannel:
 
     def plot_raw_array_histogram(self) -> None:
         """Plot a histogram of pixel intensities"""
-        plt.hist(self.raw_image, bins=256)
+        plt.hist(self.raw_image.ravel(), bins=256)
         plt.show()
 
     def get_pixel_count(self) -> int:
@@ -220,11 +230,46 @@ class IMCAblation:
 
     Attributes:
         date: date of ablation; critical for bookkeeping experimental data
-        mass_channels: collection of imaging data as collection of IMCMassChannel
+        mass_channels: collection of imaging data as tuple of `IMCMassChannel`s
+        tissue:
     """
 
-    date: datetime.date
     mass_channels: Tuple[IMCMassChannel, ...]
+    date: Optional[datetime.date]
+    tissue: Optional[Tissue]
+
+    @classmethod
+    def from_txt_files(
+        cls,
+        path_to_txt_files: pathlib.Path,
+        date: Optional[datetime.date],
+        tissue: Optional[Tissue],
+    ) -> IMCAblation:
+        """Loads raw data from an IMC experiment into `IMCAblation`
+
+        Args:
+            path_to_txt_files: pathlib.Path object representing the IMC data
+                which is usually stored in a zip file or a directory
+            date: date of ablation for book keeping
+            tissue: tpye of tissue sample; see `Tissue` class
+        Returns:
+            An `IMCAblation` object
+        """
+
+        if zipfile.is_zipfile(path_to_txt_files):
+            txt_files = [
+                f.filename
+                for f in zipfile.ZipFile(path_to_txt_files).filelist
+                if "_MACOSX" not in f.filename and f.filename.endswith(".txt")
+            ]
+        else:
+            assert os.path.isdir(path_to_txt_files)
+            txt_files = glob.glob(f"{path_to_txt_files}**/*.txt", recursive=True)
+        mass_channels = tuple(
+            IMCMassChannel.from_txt_file(pathlib.Path(f)) for f in txt_files
+        )
+
+        return IMCAblation(mass_channels=mass_channels, date=date, tissue=tissue)
 
 
 @attr.define
@@ -258,10 +303,10 @@ class ImageProcessingConfig:
 
     normalized: bool = False
     clip_percentile: Optional[float] = None
-    gaussian_sigma: Optional[int] = None
+    gaussian_sigma: Optional[float] = None
 
 
-def clip_img(img: npt.NDArray, clamp_percentile: float = 99.0) -> npt.NDArray:
+def clamp_img(img: npt.NDArray, clamp_percentile: float = 99.0) -> npt.NDArray:
     """Clips or coerces values in image array according to percentile
 
     This is desirable in image processing in general where
@@ -269,7 +314,7 @@ def clip_img(img: npt.NDArray, clamp_percentile: float = 99.0) -> npt.NDArray:
 
     Args:
         img: the numpy array to be clamped
-        clip_percentile: the threshold to be used in clipping
+        clamp_percentile: the threshold to be used in clipping
     Returns:
         A clamped image as numpy array
     """
@@ -281,7 +326,7 @@ def clip_img(img: npt.NDArray, clamp_percentile: float = 99.0) -> npt.NDArray:
     return arr
 
 
-def gaussian_filter_img(img: npt.NDArray, sigma: int = 1) -> npt.NDArray:
+def gaussian_filter_img(img: npt.NDArray, sigma: float = 1.0) -> npt.NDArray:
     """Applies Gaussian kernel to input image
 
     Simply taken from:
@@ -352,3 +397,154 @@ def colour_image(img: npt.NDArray, cmap: IMCCmap) -> npt.NDArray:
         )
 
     return array
+
+
+class ThresholdMethod(StrEnum):
+    otsu = "otsu"
+    local = "local"
+    multi_otsu = "multi_otsu"
+
+
+@attr.define
+class WatershedSegmentedIMCImage:
+    """A data class to encapsulate a single-cell watershed-based segmentation operation
+
+    Here, we apply local or global thresholding (see `ThresholdMethod`) to
+    prepare a mask to distinguish true DNA signal from tissue background.
+    Then, local peaks (analogous to cell nuclei) are selected and
+    watershed segmentation is performed to label segmented objects
+    representing single cells. The array mask used for segmentation,
+    extracted peaks, labels and borders are all generated post initialization
+    and captured as attributes.
+
+    Attributes:
+        dna_channel: the original `IMCMassChannel` for DNA
+        sigma: standard deviation for Gaussian filtering/blurring
+        gaussian_clamped_dna_image: the processed DNA channel image used
+        threshold_method: method used for distinguishing DNA (`ThresholdMethod`)
+        dna_mask: the final mask to ensure only relevant pixels are segmented/labelled
+        peaks: coordinates for local maximum points (DNA)
+        labels: numeric identifiers for labelling segmented cells
+        segmented: a labelled matrix post watershed segmentation
+        borders: a numpy array of bool dtype for visualizing segmentation boundaries
+
+    """
+
+    dna_channel: IMCMassChannel
+    threshold_method: ThresholdMethod
+    sigma: float = 3.0
+    gaussian_clamped_dna_image: npt.NDArray = attr.ib(init=False)
+    dna_mask: npt.NDArray = attr.ib(init=False)
+    peaks: npt.NDArray = attr.ib(init=False)
+    labels: npt.NDArray = attr.ib(init=False)
+    segmented: npt.NDArray = attr.ib(init=False)
+    borders: npt.NDArray = attr.ib(init=False)
+
+    @dna_channel.validator
+    def _check_element(self, attribute, value) -> None:
+        """Basic check the proper image channel is being processed
+
+        The channel must be DNA (191/193 Iridium-intercalator) for this segmentation
+        """
+        if not (element := value.metadata.element == "Ir"):
+            raise ValueError(
+                f"Expected Iridium-stained DNA channel for {attribute}, but found {element}"
+            )
+        if not (mass := value.metadata.mass != 191 or 193):
+            raise ValueError(
+                f"Expected Iridium-stained DNA channel with mass unit 191 or 193 for {attribute}, but found {mass}"
+            )
+
+    @gaussian_clamped_dna_image.default
+    def _process_dna_image(self) -> npt.NDArray:
+        """Apply clamping and Gaussian filter to raw image"""
+
+        # Load the raw image, apply clamping and Gaussian filter
+        dna_image = self.dna_channel.raw_image
+        clamped_dna_image = clamp_img(dna_image, 99.0)
+        gaussian_clamped_dna_image = gaussian_filter_img(clamped_dna_image, self.sigma)
+
+        return gaussian_clamped_dna_image
+
+    @dna_mask.default
+    def _get_dna_mask(self) -> npt.NDArray:
+        """Get mask to pass through watershed segmentation"""
+
+        # Based on the segmentation method, find the threshold value
+        if self.threshold_method == ThresholdMethod.otsu:
+            threshold = filters.threshold_otsu(self.gaussian_clamped_dna_image)
+        if self.threshold_method == ThresholdMethod.local:
+            threshold = filters.threshold_local(
+                self.gaussian_clamped_dna_image, block_size=21
+            )
+        # For multi-Otsu, extract highest threhsold value
+        if self.threshold_method == ThresholdMethod.multi_otsu:
+            threshold = filters.threshold_multiotsu(
+                self.gaussian_clamped_dna_image, classes=3
+            ).max()
+
+        # Create a synthetic mask based on pixels with
+        # intensity higher than the threshold value
+        binary_dna_image = self.gaussian_clamped_dna_image > threshold
+        dna_mask = ndi.distance_transform_edt(binary_dna_image)
+        return dna_mask
+
+    @peaks.default
+    def _find_peaks(self) -> npt.NDArray:
+        """Find local maxima peaks representing watershed starting points"""
+
+        peaks = feature.peak_local_max(self.dna_mask, min_distance=3, indices=False)
+
+        return peaks
+
+    @labels.default
+    def _get_labels(self) -> npt.NDArray:
+        """From local maximum peaks, extract numeric object labels"""
+        (labels,) = ndi.label(self.peaks)
+        return labels
+
+    @segmented.default
+    def _watershed_segment(self) -> npt.NDArray:
+        """Apply watershed filling from DNA peaks and labels"""
+
+        # Create a final mask that excludes necrosis and pixels too far from DNA
+        # these will not be labelled/segmented (for now, this is 3µ)
+        proximity_mask = (
+            ndi.distance_transform_edt(np.logical_not(self.dna_mask)) < 3
+        ) * 1
+
+        segmented = segmentation.watershed(
+            np.logical_not(self.dna_mask), self.labels, mask=proximity_mask
+        )
+
+        return segmented
+
+    @borders.default
+    def _get_borders(self) -> npt.NDArray:
+        """Extract boundaries for segmented objects"""
+        borders = segmentation.find_boundaries(
+            self.segmented, mode="outer", background=0
+        )
+        return borders
+
+    def show_segmentation(self) -> None:
+        """Display boundaries of original image, segmented cells boundaries"""
+        dna_image = self.dna_channel.raw_image
+        boundaries = segmentation.mark_boundaries(
+            dna_image / dna_image.max(),
+            self.segmented,
+            color=[1, 1, 1],
+            outline_color=[1, 0, 0],
+        )
+        fig, ax = plt.subplots(ncols=3)
+        ax[0].imshow(dna_image)
+        ax[1].imshow(boundaries)
+        ax[2].imshow(
+            np.dstack(
+                [
+                    np.zeros_like(dna_image),
+                    self.dna_mask * 0.2,
+                    dna_image / dna_image.max(),
+                ]
+            )
+        )
